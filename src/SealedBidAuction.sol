@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {ERC20} from "solmate/tokens/ERC20.sol";
+import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
 import {SafeTransferLib} from "solmate/utils/SafeTransferLib.sol";
 
 /// @title Sealed-Bid Uniform-Price Batch Auction
@@ -172,5 +173,148 @@ contract SealedBidAuction {
         seller = msg.sender;
 
         asset_.safeTransferFrom(msg.sender, address(this), supply_);
+    }
+
+    // ---- Bidding ----
+
+    /// @notice Commit a hashed bid, escrowing `deposit` of `payment` (SPEC §1.3).
+    /// @dev `h = keccak256(abi.encode(address(this), msg.sender, price, quantity, salt))`.
+    /// `address(this)` blocks cross-deployment replay; `msg.sender` makes hash-copying a pure
+    /// self-grief (the copier can never open it). Multiple commits per address are
+    /// independent bids. Deposits may exceed the bid's max spend — over-depositing is the
+    /// bidder's obfuscation lever against the deposit-size leak.
+    function commit(bytes32 h, uint256 deposit) external returns (uint256 commitId) {
+        if (phase() != Phase.Commit) revert WrongPhase();
+        commitId = commits.length;
+        if (commitId >= maxBids) revert MaxBidsReached();
+
+        commits.push(
+            Commitment({
+                bidder: msg.sender,
+                revealIdx: 0,
+                commitHash: h,
+                deposit: deposit,
+                revealed: false,
+                claimed: false
+            })
+        );
+        totalDeposits += deposit;
+        emit Committed(commitId, msg.sender, deposit);
+
+        payment.safeTransferFrom(msg.sender, address(this), deposit);
+    }
+
+    /// @notice Open commitment `commitId` as a bid at `price` for `quantity` (SPEC §1.4).
+    /// @dev The reserve is enforced here, not at settlement — every bid that reaches
+    /// settlement is already eligible. The deposit must cover
+    /// `maxSpend = mulDivUp(price, quantity, 1e18)`; uint128 inputs cannot overflow the
+    /// product. The bid's reveal index is recorded on the commitment (SPEC §12 A4) so claims
+    /// are O(1).
+    function reveal(uint256 commitId, uint128 price, uint128 quantity, bytes32 salt)
+        external
+        returns (uint256 revealIdx)
+    {
+        if (phase() != Phase.Reveal) revert WrongPhase();
+        if (commitId >= commits.length) revert BadCommit();
+        Commitment storage c = commits[commitId];
+        if (c.revealed) revert BadCommit();
+        if (c.bidder != msg.sender) revert BadCommit();
+        if (keccak256(abi.encode(address(this), msg.sender, price, quantity, salt)) != c.commitHash)
+        {
+            revert BadCommit();
+        }
+        if (quantity == 0 || price < reservePrice) revert BadBid();
+        if (c.deposit < FixedPointMathLib.mulDivUp(price, quantity, WAD)) revert BadBid();
+
+        revealIdx = bids.length;
+        c.revealed = true;
+        c.revealIdx = uint96(revealIdx); // safe: revealIdx < maxBids <= type(uint32).max
+        bids.push(Bid({commitId: commitId, price: price, quantity: quantity, fill: 0}));
+        revealedDeposits += c.deposit;
+        emit Revealed(commitId, revealIdx, price, quantity);
+    }
+
+    // ---- Claims (SPEC §1.6: pull-only, CEI, one-shot; §12 A3: permissionless) ----
+
+    /// @notice Pay out commitment `commitId`'s entitlement. Callable by anyone; funds always
+    /// go to the recorded bidder. SETTLED: winners receive `fill` of asset plus
+    /// `deposit - pay` of payment, revealed losers their full deposit, non-revealers nothing
+    /// (deposit forfeited to the sweep). VOID: full deposit back for everyone.
+    /// @dev REFUND-UNDERFLOW LEMMA (SPEC §1.7). For any winner `clearingPrice <= price`
+    /// (canonical order is price-descending and winners sit at or above the marginal bid)
+    /// and `fill <= quantity`; `mulDivUp` is monotone in both multiplicands, so
+    /// `pay = mulDivUp(clearingPrice, fill, 1e18) <= mulDivUp(price, quantity, 1e18)
+    /// = maxSpend <= deposit` (enforced at reveal). `deposit - pay` cannot underflow.
+    function claimBidder(uint256 commitId) external {
+        Phase p = phase();
+        if (p != Phase.Settled && p != Phase.Void) revert WrongPhase();
+        if (commitId >= commits.length) revert BadCommit();
+        Commitment storage c = commits[commitId];
+        if (c.claimed) revert AlreadyClaimed();
+
+        uint256 assetOut;
+        uint256 paymentOut;
+        if (p == Phase.Void) {
+            paymentOut = c.deposit; // full refund, revealed or not — VOID punishes nobody
+        } else if (c.revealed) {
+            Bid storage b = bids[c.revealIdx];
+            assetOut = b.fill; // 0 for losers, so this branch covers winner and loser alike
+            paymentOut = c.deposit - FixedPointMathLib.mulDivUp(clearingPrice, b.fill, WAD);
+        } else {
+            revert NothingToClaim(); // forfeited; burned in aggregate by sweepForfeits
+        }
+
+        c.claimed = true;
+        emit BidderClaimed(commitId, assetOut, paymentOut);
+        if (assetOut > 0) asset.safeTransfer(c.bidder, assetOut);
+        if (paymentOut > 0) payment.safeTransfer(c.bidder, paymentOut);
+    }
+
+    /// @notice Pay the seller. Callable by anyone; funds always go to `seller`.
+    /// SETTLED: `proceeds` of payment plus the unsold `supply - totalSold` of asset.
+    /// VOID: the full supply back.
+    function claimSeller() external {
+        Phase p = phase();
+        if (p != Phase.Settled && p != Phase.Void) revert WrongPhase();
+        if (sellerClaimed) revert AlreadyClaimed();
+        sellerClaimed = true;
+
+        uint256 paymentOut;
+        uint256 assetOut;
+        if (p == Phase.Void) {
+            assetOut = supply;
+        } else {
+            paymentOut = proceeds;
+            assetOut = supply - totalSold;
+        }
+        emit SellerClaimed(paymentOut, assetOut);
+        if (paymentOut > 0) payment.safeTransfer(seller, paymentOut);
+        if (assetOut > 0) asset.safeTransfer(seller, assetOut);
+    }
+
+    // ---- Views (SPEC §5) ----
+
+    /// @notice Current phase, derived from `block.timestamp` and `settled` (SPEC §1.2) —
+    /// no stored phase variable to desynchronize. All boundaries are inclusive.
+    function phase() public view returns (Phase) {
+        if (settled) return Phase.Settled;
+        uint256 t = block.timestamp;
+        if (t <= commitEnd) return Phase.Commit;
+        if (t <= revealEnd) return Phase.Reveal;
+        if (t <= settleDeadline) return Phase.SettleWindow;
+        return Phase.Void;
+    }
+
+    /// @notice Number of revealed bids, R. Reveal indices are dense in [0, R).
+    function revealedCount() external view returns (uint256) {
+        return bids.length;
+    }
+
+    function getBid(uint256 revealIdx) external view returns (Bid memory) {
+        return bids[revealIdx];
+    }
+
+    function getCommitment(uint256 commitId) external view returns (Commitment memory) {
+        return commits[commitId];
     }
 }
