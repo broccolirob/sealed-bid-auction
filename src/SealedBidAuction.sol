@@ -234,6 +234,99 @@ contract SealedBidAuction {
         emit Revealed(commitId, revealIdx, price, quantity);
     }
 
+    // ---- Settlement (SPEC §1.5) ----
+
+    /// @notice Settle the auction. Permissionless, once, during SETTLE-WINDOW. `order` must
+    /// be the canonical sort of ALL reveal indices: strictly descending price, ties broken
+    /// by ascending reveal index. Exactly one permutation passes — settlement output is
+    /// deterministic regardless of who calls.
+    /// @dev Two O(R) passes: verify + fill, then proceeds. `proceeds` is the exact sum of
+    /// per-winner payments (not one rounded product), which makes payment conservation an
+    /// equality. No external calls — CEI is trivial here.
+    function settle(uint256[] calldata order) external {
+        Phase p = phase();
+        if (p == Phase.Settled) revert AlreadySettled();
+        if (p != Phase.SettleWindow) revert WrongPhase();
+
+        uint256 r = bids.length;
+        if (order.length != r) revert BadSettlementLength();
+
+        settled = true;
+
+        if (r == 0) {
+            // trivial settle: nothing revealed, seller reclaims everything via claimSeller
+            emit Settled(0, 0, 0);
+            return;
+        }
+
+        // COMPLETENESS LEMMA (SPEC §1.5). `order` is accepted only if
+        //   (i)   order.length == R          (checked above),
+        //   (ii)  every entry < R            (range check below),
+        //   (iii) no entry repeats           (bitmap check-and-set below).
+        // R distinct values drawn from a universe of exactly R values must hit each value
+        // exactly once (pigeonhole), so any accepted `order` is a permutation of [0, R):
+        // omitting a high bid to drag the clearing price down forces a length, range, or
+        // duplicate violation somewhere — each with its own revert. The ordering predicate
+        // is a strict total order (no two bids tie on (price, revealIdx)), so exactly ONE
+        // permutation passes. Corollary (PLAN D2): every check runs over the ENTIRE array,
+        // including entries after supply exhaustion — an early exit would let a duplicate
+        // hide in the unvalidated tail and reopen the omission attack.
+        uint256[] memory seen = new uint256[]((r + 255) >> 8);
+
+        uint128 supply_ = supply;
+        uint128 cum = 0;
+        uint256 lastFilledPos = 0;
+        uint256 prevIdx = 0;
+        uint128 prevPrice = 0;
+
+        for (uint256 pos = 0; pos < r; pos++) {
+            uint256 idx = order[pos];
+            if (idx >= r) revert OutOfRange();
+
+            uint256 word = idx >> 8;
+            uint256 bit = 1 << (idx & 0xff);
+            if (seen[word] & bit != 0) revert DuplicateEntry();
+            seen[word] |= bit;
+
+            Bid storage b = bids[idx];
+            uint128 price = b.price;
+            // canonical predicate vs the previous entry (SPEC §1.5):
+            //   bids[b].price < bids[a].price || (equal && b > a)
+            if (pos > 0 && !(price < prevPrice || (price == prevPrice && idx > prevIdx))) {
+                revert BadOrdering();
+            }
+            prevIdx = idx;
+            prevPrice = price;
+
+            // Fill top-down. Only the fill SSTORE is skipped once supply is exhausted —
+            // validation continues over the whole array (see lemma corollary above).
+            if (cum < supply_) {
+                uint128 remaining = supply_ - cum;
+                uint128 qty = b.quantity;
+                uint128 f = qty < remaining ? qty : remaining;
+                b.fill = f; // f > 0: remaining > 0 and qty > 0 (reveal enforced)
+                cum += f;
+                lastFilledPos = pos;
+            }
+        }
+
+        // The marginal (lowest filled) bid prices everyone. Well-defined: r > 0, supply > 0
+        // and every quantity > 0 mean position 0 always fills.
+        uint128 clearing = bids[order[lastFilledPos]].price;
+
+        // Pass 2 — proceeds as the exact sum of per-winner payments. Positions
+        // 0..lastFilledPos all have fill > 0 (fills are a prefix of the canonical order).
+        uint256 total = 0;
+        for (uint256 pos = 0; pos <= lastFilledPos; pos++) {
+            total += FixedPointMathLib.mulDivUp(clearing, bids[order[pos]].fill, WAD);
+        }
+
+        clearingPrice = clearing;
+        totalSold = cum;
+        proceeds = total;
+        emit Settled(clearing, cum, total);
+    }
+
     // ---- Claims (SPEC §1.6: pull-only, CEI, one-shot; §12 A3: permissionless) ----
 
     /// @notice Pay out commitment `commitId`'s entitlement. Callable by anyone; funds always
@@ -290,6 +383,23 @@ contract SealedBidAuction {
         emit SellerClaimed(paymentOut, assetOut);
         if (paymentOut > 0) payment.safeTransfer(seller, paymentOut);
         if (assetOut > 0) asset.safeTransfer(seller, assetOut);
+    }
+
+    /// @notice Burn all forfeited (unrevealed) deposits. SETTLED only, once, callable by
+    /// anyone. Forfeits go to the sink, not the seller — routing them to the seller would
+    /// make phantom demand-signaling commits free (SPEC §2). In VOID forfeits don't exist:
+    /// a failed auction punishes nobody.
+    /// @dev O(1): `totalDeposits` accrues at commit, `revealedDeposits` at reveal; the
+    /// difference is exactly the unrevealed deposits. A zero-forfeit sweep succeeds (burns
+    /// nothing) so the function is total in the SETTLED state.
+    function sweepForfeits() external {
+        if (phase() != Phase.Settled) revert WrongPhase();
+        if (forfeitsSwept) revert AlreadyClaimed();
+        forfeitsSwept = true;
+
+        uint256 amount = totalDeposits - revealedDeposits;
+        emit ForfeitsBurned(amount);
+        if (amount > 0) payment.safeTransfer(FORFEIT_SINK, amount);
     }
 
     // ---- Views (SPEC §5) ----
